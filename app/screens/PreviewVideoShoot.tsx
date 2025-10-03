@@ -80,7 +80,21 @@ const PreviewVideoShoot = () => {
   
   // Audio Player for background music
   const audioPlayerRef = useRef<Audio.Sound | null>(null);
+  const lastSyncTimeRef = useRef<number>(0);
   const [isAudioLoaded, setIsAudioLoaded] = useState<boolean>(false);
+  const [isVideoPlaying, setIsVideoPlaying] = useState<boolean>(false);
+  const [audioDuration, setAudioDuration] = useState<number>(0);
+  const [videoDuration, setVideoDuration] = useState<number>(0);
+  const [previousVideoTime, setPreviousVideoTime] = useState<number>(0);
+
+  // Voice Recording States
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [recordedAudioUri, setRecordedAudioUri] = useState<string | null>(null);
+  const [voicePlayerRef, setVoicePlayerRef] = useState<Audio.Sound | null>(null);
+  const [isVoiceLoaded, setIsVoiceLoaded] = useState<boolean>(false);
+  const [voiceVolume, setVoiceVolume] = useState<number>(50);
+  const [isVoiceMuted, setIsVoiceMuted] = useState<boolean>(false);
+  const recordingRef = useRef<Audio.Recording | null>(null);
 
   // Transition Effects State
   const [transitionEffects, setTransitionEffects] = useState<Array<{
@@ -181,31 +195,246 @@ const PreviewVideoShoot = () => {
 
   const player = useVideoPlayer(videoUri || "", (player) => {
     player.loop = false;
-    player.play();
+    // Don't auto-play, let user control it
   });
 
   useEvent(player, 'statusChange', {
     status: player.status,
   });
 
+  // Function to handle audio duration synchronization (optimized with debounce)
+  const handleAudioDurationSync = async () => {
+    if (!audioPlayerRef.current || !isAudioLoaded || !player || audioDuration === 0 || videoDuration === 0) {
+      return;
+    }
+
+    // Debounce: only sync if enough time has passed since last sync
+    const now = Date.now();
+    if (now - lastSyncTimeRef.current < 300) { // Minimum 300ms between syncs
+      return;
+    }
+    lastSyncTimeRef.current = now;
+
+    try {
+      const audioStatus = await audioPlayerRef.current.getStatusAsync();
+      if (!audioStatus.isLoaded || !audioStatus.isPlaying) return;
+
+      const currentAudioTime = audioStatus.positionMillis! / 1000;
+      const currentVideoTime = player.currentTime || 0;
+
+      // If audio is longer than video, stop audio when video ends
+      if (audioDuration >= videoDuration) {
+        if (currentVideoTime >= videoDuration - 0.1) { // Stop slightly before end
+          await audioPlayerRef.current.pauseAsync();
+          console.log('Audio stopped at video end');
+        }
+      } else {
+        // If video is longer than audio, loop the audio
+        if (currentAudioTime >= audioDuration - 0.1) { // Loop slightly before end
+          await audioPlayerRef.current.setPositionAsync(0);
+          console.log('Audio looped back to start');
+        }
+      }
+    } catch (error) {
+      console.error('Error in audio duration sync:', error);
+    }
+  };
+
+  // Function to handle voice recording duration synchronization
+  const handleVoiceDurationSync = async () => {
+    if (!voicePlayerRef || !isVoiceLoaded || !player || videoDuration === 0) {
+      return;
+    }
+
+    try {
+      const voiceStatus = await voicePlayerRef.getStatusAsync();
+      if (!voiceStatus.isLoaded || !voiceStatus.isPlaying) return;
+
+      const currentVoiceTime = voiceStatus.positionMillis! / 1000;
+      const currentVideoTime = player.currentTime || 0;
+
+      // Voice recording should match video duration exactly
+      if (currentVideoTime >= videoDuration - 0.1) { // Stop slightly before end
+        await voicePlayerRef.pauseAsync();
+        console.log('Voice recording stopped at video end');
+      }
+    } catch (error) {
+      console.error('Error in voice duration sync:', error);
+    }
+  };
+
+  // Function to reset audio position when video is restarted
+  const resetAudioPosition = async () => {
+    if (audioPlayerRef.current && isAudioLoaded) {
+      try {
+        await audioPlayerRef.current.setPositionAsync(0);
+        console.log('Audio position reset to start');
+      } catch (error) {
+        console.error('Error resetting audio position:', error);
+      }
+    }
+  };
+
+  // Function to reset voice recording position when video is restarted
+  const resetVoicePosition = async () => {
+    if (voicePlayerRef && isVoiceLoaded) {
+      try {
+        await voicePlayerRef.setPositionAsync(0);
+        console.log('Voice recording position reset to start');
+      } catch (error) {
+        console.error('Error resetting voice recording position:', error);
+      }
+    }
+  };
+
+  // Function to update voice recording volume
+  const updateVoiceVolume = async (newVolume: number) => {
+    setVoiceVolume(newVolume);
+    if (voicePlayerRef && isVoiceLoaded) {
+      try {
+        await voicePlayerRef.setVolumeAsync(newVolume / 100);
+        console.log('Voice recording volume updated to:', newVolume);
+      } catch (error) {
+        console.error('Error updating voice recording volume:', error);
+      }
+    }
+  };
+
+  // Function to toggle voice recording mute
+  const toggleVoiceMute = async () => {
+    const newMutedState = !isVoiceMuted;
+    setIsVoiceMuted(newMutedState);
+    
+    if (voicePlayerRef && isVoiceLoaded) {
+      try {
+        await voicePlayerRef.setVolumeAsync(newMutedState ? 0 : voiceVolume / 100);
+        console.log('Voice recording mute toggled to:', newMutedState);
+      } catch (error) {
+        console.error('Error toggling voice recording mute:', error);
+      }
+    }
+  };
+
+  // Function to sync audio position with video position when seeking (optimized with debounce)
+  const syncAudioPositionWithVideo = async () => {
+    if (!audioPlayerRef.current || !isAudioLoaded || !player || audioDuration === 0 || videoDuration === 0) {
+      return;
+    }
+
+    // Debounce: only sync if enough time has passed since last sync
+    const now = Date.now();
+    if (now - lastSyncTimeRef.current < 500) { // Minimum 500ms between seeks
+      return;
+    }
+    lastSyncTimeRef.current = now;
+
+    try {
+      const currentVideoTime = player.currentTime || 0;
+      let targetAudioTime = currentVideoTime;
+
+      // If video is longer than audio, calculate the correct audio position within the loop
+      if (videoDuration > audioDuration) {
+        targetAudioTime = currentVideoTime % audioDuration;
+      } else {
+        // If audio is longer than video, clamp to audio duration
+        targetAudioTime = Math.min(currentVideoTime, audioDuration);
+      }
+
+      await audioPlayerRef.current.setPositionAsync(targetAudioTime * 1000);
+      console.log(`Audio synced to video position: ${targetAudioTime.toFixed(1)}s`);
+    } catch (error) {
+      console.error('Error syncing audio position with video:', error);
+    }
+  };
+
   // Sync audio player with video playback
   useEffect(() => {
     const syncAudioWithVideo = async () => {
       if (audioPlayerRef.current && isAudioLoaded && player) {
         try {
-          if (player.playing) {
+          const isPlaying = player.playing;
+          setIsVideoPlaying(isPlaying);
+          
+          if (isPlaying) {
             await audioPlayerRef.current.playAsync();
+            console.log('Audio started playing with video');
           } else {
             await audioPlayerRef.current.pauseAsync();
+            console.log('Audio paused with video');
           }
         } catch (error) {
           console.error('Error syncing audio with video:', error);
         }
       }
+
+      // Sync voice recording with video playback
+      if (voicePlayerRef && isVoiceLoaded && player) {
+        try {
+          const isPlaying = player.playing;
+          
+          if (isPlaying) {
+            await voicePlayerRef.playAsync();
+            console.log('Voice recording started playing with video');
+          } else {
+            await voicePlayerRef.pauseAsync();
+            console.log('Voice recording paused with video');
+          }
+        } catch (error) {
+          console.error('Error syncing voice recording with video:', error);
+        }
+      }
     };
 
     syncAudioWithVideo();
-  }, [player?.playing, isAudioLoaded]);
+  }, [player?.playing, isAudioLoaded, isVoiceLoaded]);
+
+  // Monitor audio duration synchronization while playing (optimized)
+  useEffect(() => {
+    if (!isVideoPlaying || !isAudioLoaded || audioDuration === 0 || videoDuration === 0) {
+      return;
+    }
+
+    const syncInterval = setInterval(() => {
+      handleAudioDurationSync();
+    }, 500); // Reduced frequency to 500ms to prevent lag
+
+    return () => clearInterval(syncInterval);
+  }, [isVideoPlaying, isAudioLoaded, audioDuration, videoDuration]);
+
+  // Monitor voice recording duration synchronization while playing
+  useEffect(() => {
+    if (!isVideoPlaying || !isVoiceLoaded || videoDuration === 0) {
+      return;
+    }
+
+    const syncInterval = setInterval(() => {
+      handleVoiceDurationSync();
+    }, 500); // Same frequency as audio sync
+
+    return () => clearInterval(syncInterval);
+  }, [isVideoPlaying, isVoiceLoaded, videoDuration]);
+
+  // Reset audio position when video is restarted (optimized)
+  useEffect(() => {
+    if (player && isAudioLoaded && currentTime < 1) { // Video restarted (near beginning)
+      resetAudioPosition();
+    }
+    if (player && isVoiceLoaded && currentTime < 1) { // Video restarted (near beginning)
+      resetVoicePosition();
+    }
+  }, [currentTime, isAudioLoaded, isVoiceLoaded]);
+
+  // Sync audio position when video is seeked (optimized - only on significant changes)
+  useEffect(() => {
+    if (isVideoPlaying && isAudioLoaded && audioDuration > 0 && videoDuration > 0) {
+      // Only sync on significant time changes to prevent excessive operations
+      const timeDiff = Math.abs(currentTime - (previousVideoTime || 0));
+      if (timeDiff > 1.0) { // Increased threshold to 1 second to reduce sync frequency
+        syncAudioPositionWithVideo();
+        setPreviousVideoTime(currentTime);
+      }
+    }
+  }, [currentTime, isVideoPlaying, isAudioLoaded, audioDuration, videoDuration]);
 
   // Set up audio mode for better control
   useEffect(() => {
@@ -271,6 +500,12 @@ const PreviewVideoShoot = () => {
     return () => {
       if (audioPlayerRef.current) {
         audioPlayerRef.current.unloadAsync().catch(console.error);
+      }
+      if (voicePlayerRef) {
+        voicePlayerRef.unloadAsync().catch(console.error);
+      }
+      if (recordingRef.current) {
+        recordingRef.current.stopAndUnloadAsync().catch(console.error);
       }
     };
   }, []);
@@ -1217,6 +1452,130 @@ const PreviewVideoShoot = () => {
     }
   };
 
+  // Voice Recording Functions
+  const startVoiceRecording = async () => {
+    try {
+      // Request permissions
+      const { status } = await Audio.requestPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permission Required', 'Microphone permission is required for voice recording');
+        return;
+      }
+
+      // Set up audio mode for recording
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        staysActiveInBackground: false,
+        playThroughEarpieceAndroid: false,
+      });
+
+      // Create recording
+      const recording = new Audio.Recording();
+      await recording.prepareToRecordAsync({
+        android: {
+          extension: '.m4a',
+          outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+          audioEncoder: Audio.AndroidAudioEncoder.AAC,
+          sampleRate: 44100,
+          numberOfChannels: 2,
+          bitRate: 128000,
+        },
+        ios: {
+          extension: '.m4a',
+          outputFormat: Audio.IOSOutputFormat.MPEG4AAC,
+          audioQuality: Audio.IOSAudioQuality.HIGH,
+          sampleRate: 44100,
+          numberOfChannels: 2,
+          bitRate: 128000,
+          linearPCMBitDepth: 16,
+          linearPCMIsBigEndian: false,
+          linearPCMIsFloat: false,
+        },
+        web: {
+          mimeType: 'audio/webm',
+          bitsPerSecond: 128000,
+        },
+      });
+
+      recordingRef.current = recording;
+      await recording.startAsync();
+      setIsRecording(true);
+
+      // Auto-stop recording when video duration is reached
+      const videoDuration = getFullDuration();
+      if (videoDuration > 0) {
+        setTimeout(async () => {
+          if (isRecording) {
+            await stopVoiceRecording();
+          }
+        }, videoDuration * 1000);
+      }
+
+      console.log('Voice recording started');
+    } catch (error) {
+      console.error('Error starting voice recording:', error);
+      Alert.alert('Error', 'Failed to start voice recording');
+    }
+  };
+
+  const stopVoiceRecording = async () => {
+    try {
+      if (!recordingRef.current) return;
+
+      await recordingRef.current.stopAndUnloadAsync();
+      const uri = recordingRef.current.getURI();
+      
+      if (uri) {
+        setRecordedAudioUri(uri);
+        
+        // Load the recorded audio
+        const { sound } = await Audio.Sound.createAsync(
+          { uri },
+          {
+            shouldPlay: false,
+            volume: voiceVolume / 100,
+            isLooping: false,
+          }
+        );
+
+        setVoicePlayerRef(sound);
+        setIsVoiceLoaded(true);
+        setIsRecording(false);
+        recordingRef.current = null;
+
+        console.log('Voice recording completed:', uri);
+        Alert.alert('Success', 'Voice recording completed successfully!');
+      }
+    } catch (error) {
+      console.error('Error stopping voice recording:', error);
+      Alert.alert('Error', 'Failed to stop voice recording');
+      setIsRecording(false);
+    }
+  };
+
+  const deleteVoiceRecording = async () => {
+    try {
+      if (voicePlayerRef) {
+        await voicePlayerRef.unloadAsync();
+        setVoicePlayerRef(null);
+      }
+      
+      if (recordedAudioUri) {
+        await FileSystem.deleteAsync(recordedAudioUri, { idempotent: true });
+        setRecordedAudioUri(null);
+      }
+      
+      setIsVoiceLoaded(false);
+      setIsRecording(false);
+      Alert.alert('Success', 'Voice recording deleted successfully!');
+    } catch (error) {
+      console.error('Error deleting voice recording:', error);
+      Alert.alert('Error', 'Failed to delete voice recording');
+    }
+  };
+
   const handleAudioAdded = async (audioUri: string, audioName: string) => {
     if (!videoUri) {
       Alert.alert('Error', 'No video loaded to add audio to');
@@ -1237,29 +1596,54 @@ const PreviewVideoShoot = () => {
 
       console.log('Loading audio file:', { audioUri, audioName });
       
+      // Get video duration
+      const currentVideoDuration = getFullDuration();
+      console.log('Video duration:', currentVideoDuration);
+      
       // Load the audio file using expo-av
       const { sound } = await Audio.Sound.createAsync(
         { uri: audioUri },
         { 
           shouldPlay: false,
           volume: getActualAudioVolume(),
-          isLooping: true, // Loop the audio to match video length
+          isLooping: false, // We'll handle looping manually based on duration
         }
       );
+
+      // Get audio duration
+      const audioStatus = await sound.getStatusAsync();
+      const currentAudioDuration = audioStatus.isLoaded ? audioStatus.durationMillis! / 1000 : 0;
+      console.log('Audio duration:', currentAudioDuration);
+
+      // Store durations in state
+      setVideoDuration(currentVideoDuration);
+      setAudioDuration(currentAudioDuration);
 
       // Store the audio player reference
       audioPlayerRef.current = sound;
       setIsAudioLoaded(true);
 
+      // Set up audio duration synchronization
+      if (currentAudioDuration > 0 && currentVideoDuration > 0) {
+        if (currentAudioDuration >= currentVideoDuration) {
+          // Audio is longer than video - we'll stop it at video duration
+          console.log('Audio is longer than video, will stop at video duration');
+        } else {
+          // Video is longer than audio - we'll loop the audio
+          console.log('Video is longer than audio, will loop audio');
+        }
+      }
+
       Alert.alert(
         'Success',
-        `Background music "${audioName}" loaded successfully!`,
+        `Background music "${audioName}" loaded successfully!\nVideo: ${currentVideoDuration.toFixed(1)}s, Audio: ${currentAudioDuration.toFixed(1)}s`,
         [{ text: 'OK' }]
       );
 
       // If video is currently playing, start the audio too
-      if (player?.playing) {
+      if (player?.playing && isVideoPlaying) {
         await sound.playAsync();
+        console.log('Audio started with video on load');
       }
 
     } catch (error) {
@@ -1340,6 +1724,26 @@ const PreviewVideoShoot = () => {
                 allowsFullscreen
                 allowsPictureInPicture
               />
+              
+              {/* Play/Pause Overlay Button */}
+              <TouchableOpacity 
+                style={styles.playPauseOverlay}
+                onPress={() => {
+                  if (player.playing) {
+                    player.pause();
+                    setIsVideoPlaying(false);
+                  } else {
+                    player.play();
+                    setIsVideoPlaying(true);
+                  }
+                }}
+              >
+                <MaterialIcons 
+                  name={player.playing ? "pause" : "play-arrow"} 
+                  size={moderateScale(50)} 
+                  color="rgba(255, 255, 255, 0.8)" 
+                />
+              </TouchableOpacity>
                 
                 {/* Transition Effect Overlay */}
                 {activeTransition && (
@@ -1697,14 +2101,28 @@ const PreviewVideoShoot = () => {
               )}
               
               {activeEditorTool === 'audio' && (
-                  <View style={styles.audioEditorContainer}>
+                  <ScrollView 
+                    style={styles.audioEditorContainer}
+                    contentContainerStyle={styles.audioEditorContent}
+                    showsVerticalScrollIndicator={false}
+                  >
                     <VolumeControl 
                       style={styles.audioVolumeControl}
                       showLabel={true}
                       onAudioAdded={handleAudioAdded}
                       onAudioRemoved={handleAudioRemoved}
+                      // Voice recording props
+                      isRecording={isRecording}
+                      isVoiceLoaded={isVoiceLoaded}
+                      voiceVolume={voiceVolume}
+                      isVoiceMuted={isVoiceMuted}
+                      onStartRecording={startVoiceRecording}
+                      onStopRecording={stopVoiceRecording}
+                      onDeleteVoice={deleteVoiceRecording}
+                      onVoiceVolumeChange={updateVoiceVolume}
+                      onVoiceMuteToggle={toggleVoiceMute}
                     />
-                  </View>
+                  </ScrollView>
               )}
               
               {activeEditorTool === 'filters' && (
@@ -1736,10 +2154,15 @@ const styles = StyleSheet.create({
     backgroundColor: "#1a1a1a",
   },
   audioEditorContainer: {
+    flex: 1,
     padding: moderateScale(20),
     backgroundColor: 'rgba(255, 255, 255, 0.05)',
     borderRadius: moderateScale(8),
     margin: moderateScale(10),
+  },
+  audioEditorContent: {
+    flexGrow: 1,
+    paddingBottom: moderateScale(20),
   },
   audioVolumeControl: {
     backgroundColor: 'transparent',
@@ -1813,6 +2236,19 @@ const styles = StyleSheet.create({
     height: moderateScale(440),
     borderRadius: moderateScale(10),
     backgroundColor: "black",
+  },
+  playPauseOverlay: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    transform: [{ translateX: -25 }, { translateY: -25 }],
+    width: moderateScale(50),
+    height: moderateScale(50),
+    borderRadius: moderateScale(25),
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 5,
   },
   playControlContainer: {
     flexDirection: "row",
